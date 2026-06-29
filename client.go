@@ -1,32 +1,40 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 const (
-	ProtocolVersion uint8 = 0x01
-	CmdConnect      uint8 = 0x01
-	HeaderLength    int   = 20
+	ProtocolVersion uint8  = 0x01
+	CmdConnect      uint8  = 0x01
+	HeaderLength    int    = 20
+	TimeSlotSeconds int64  = 300
+	FrameHeaderSize       = 4
+	MaxPadding            = 512
 )
 
 type ClientConfig struct {
 	LocalSocksAddr string
 	RemoteAddr     string
-	SecretToken    []byte
+	SecretSeed     []byte
 	ServerName     string
 }
 
 type ProxyClient struct {
-	cfg      ClientConfig
-	tlsCfg   *tls.Config
+	cfg    ClientConfig
+	tlsCfg *tls.Config
 }
 
 func NewProxyClient(cfg ClientConfig) *ProxyClient {
@@ -37,6 +45,12 @@ func NewProxyClient(cfg ClientConfig) *ProxyClient {
 			ServerName:         cfg.ServerName,
 		},
 	}
+}
+
+func deriveToken(seed []byte, slot int64) []byte {
+	mac := hmac.New(sha256.New, seed)
+	mac.Write(binary.BigEndian.AppendUint64(nil, uint64(slot)))
+	return mac.Sum(nil)[:16]
 }
 
 func (c *ProxyClient) Start() {
@@ -118,10 +132,12 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 		return
 	}
 
+	token := deriveToken(c.cfg.SecretSeed, time.Now().Unix()/TimeSlotSeconds)
+
 	header := make([]byte, HeaderLength)
 	header[0] = ProtocolVersion
 	header[1] = CmdConnect
-	copy(header[2:18], c.cfg.SecretToken)
+	copy(header[2:18], token)
 	binary.BigEndian.PutUint16(header[18:20], uint16(len(targetAddr)))
 
 	packet := append(header, []byte(targetAddr)...)
@@ -132,31 +148,106 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 
 	_, _ = localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
+	pc := &paddedConn{Conn: serverConn}
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(serverConn, localConn)
+		relayWithPadding(pc, localConn)
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(localConn, serverConn)
-		if tc, ok := localConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
+		relayWithPadding(localConn, pc)
 	}()
 
 	wg.Wait()
 	serverConn.Close()
 }
 
-func getSecretToken() []byte {
-	if token := os.Getenv("PROXY_TOKEN"); len(token) == 16 {
-		return []byte(token)
+func relayWithPadding(dst io.Writer, src io.Reader) {
+	buf := make([]byte, 16384)
+	for {
+		n, err := src.Read(buf)
+		if err != nil {
+			return
+		}
+		if err := writePaddedFrame(dst, buf[:n]); err != nil {
+			return
+		}
 	}
-	log.Println("⚠️ 环境变量 PROXY_TOKEN 未设置或长度不是 16，使用默认硬编码 Token（仅供测试）")
+}
+
+func writePaddedFrame(w io.Writer, data []byte) error {
+	dLen := len(data)
+	pLen := 0
+	if MaxPadding > 0 {
+		var b [1]byte
+		rand.Read(b[:])
+		pLen = int(b[0]) % (MaxPadding + 1)
+	}
+	fLen := dLen + pLen
+
+	header := []byte{
+		byte(fLen >> 8), byte(fLen),
+		byte(dLen >> 8), byte(dLen),
+	}
+
+	frame := make([]byte, FrameHeaderSize+fLen)
+	copy(frame[:FrameHeaderSize], header)
+	copy(frame[FrameHeaderSize:], data)
+	if pLen > 0 {
+		rand.Read(frame[FrameHeaderSize+dLen:])
+	}
+
+	_, err := w.Write(frame)
+	return err
+}
+
+func readPaddedFrame(r io.Reader) ([]byte, error) {
+	hdr := make([]byte, FrameHeaderSize)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return nil, err
+	}
+	fLen := int(hdr[0])<<8 | int(hdr[1])
+	dLen := int(hdr[2])<<8 | int(hdr[3])
+	if fLen < dLen || dLen == 0 {
+		return nil, errors.New("invalid frame")
+	}
+
+	frame := make([]byte, fLen)
+	if _, err := io.ReadFull(r, frame); err != nil {
+		return nil, err
+	}
+	return frame[:dLen], nil
+}
+
+type paddedConn struct {
+	net.Conn
+}
+
+func (c *paddedConn) Read(b []byte) (int, error) {
+	data, err := readPaddedFrame(c.Conn)
+	if err != nil {
+		return 0, err
+	}
+	return copy(b, data), nil
+}
+
+func (c *paddedConn) Write(b []byte) (int, error) {
+	err := writePaddedFrame(c.Conn, b)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func getSecretSeed() []byte {
+	if s := os.Getenv("PROXY_TOKEN"); len(s) == 16 {
+		return []byte(s)
+	}
+	log.Println("⚠️ 环境变量 PROXY_TOKEN 未设置或长度不是 16，使用默认硬编码 Seed（仅供测试）")
 	return []byte("my_secure_token!")
 }
 
@@ -169,9 +260,11 @@ func main() {
 	client := NewProxyClient(ClientConfig{
 		LocalSocksAddr: "127.0.0.1:1080",
 		RemoteAddr:     addr,
-		SecretToken:    getSecretToken(),
+		SecretSeed:     getSecretSeed(),
 		ServerName:     "www.cisco.com",
 	})
+
+	log.Printf("当前 Token: %x", deriveToken(getSecretSeed(), time.Now().Unix()/TimeSlotSeconds))
 
 	client.Start()
 }

@@ -1,13 +1,17 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
@@ -23,11 +27,17 @@ const (
 	CmdPing         uint8 = 0x02
 	CmdPong         uint8 = 0x03
 	HeaderLength    int   = 20
+
+	TimeSlotSeconds int64 = 300
+
+	FrameHeaderSize = 4
+	MaxPadding      = 512
 )
 
 type Config struct {
-	ListenAddr  string
-	SecretToken []byte
+	ListenAddr   string
+	SecretSeed   []byte
+	FallbackAddr string
 }
 
 type Server struct {
@@ -35,10 +45,37 @@ type Server struct {
 }
 
 func NewServer(cfg Config) *Server {
-	if len(cfg.SecretToken) != 16 {
-		log.Fatalf("Fatal: SecretToken must be exactly 16 bytes")
+	if len(cfg.SecretSeed) != 16 {
+		log.Fatalf("Fatal: SecretSeed must be exactly 16 bytes")
+	}
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = "0.0.0.0:443"
 	}
 	return &Server{cfg: cfg}
+}
+
+func deriveTokens(seed []byte) [][]byte {
+	slot := time.Now().Unix() / TimeSlotSeconds
+	return [][]byte{
+		deriveToken(seed, slot),
+		deriveToken(seed, slot-1),
+		deriveToken(seed, slot+1),
+	}
+}
+
+func deriveToken(seed []byte, slot int64) []byte {
+	mac := hmac.New(sha256.New, seed)
+	mac.Write(binary.BigEndian.AppendUint64(nil, uint64(slot)))
+	return mac.Sum(nil)[:16]
+}
+
+func checkToken(seed []byte, received []byte) bool {
+	for _, t := range deriveTokens(seed) {
+		if subtle.ConstantTimeCompare(received, t) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) Start() {
@@ -52,7 +89,7 @@ func (s *Server) Start() {
 	listener := tls.NewListener(tcpListener, tlsConfig)
 	defer listener.Close()
 
-	log.Printf("🚀 TCP+TLS 代理服务端已就绪，监听 %s\n", s.cfg.ListenAddr)
+	log.Printf("🚀 服务端已就绪，监听 %s\n", s.cfg.ListenAddr)
 
 	for {
 		conn, err := listener.Accept()
@@ -64,35 +101,35 @@ func (s *Server) Start() {
 	}
 }
 
-func (s *Server) handleConn(conn net.Conn) {
-	defer conn.Close()
+func (s *Server) handleConn(tlsConn net.Conn) {
+	defer tlsConn.Close()
 
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	headerBuf := make([]byte, HeaderLength)
-	if _, err := io.ReadFull(conn, headerBuf); err != nil {
+	_, err := io.ReadFull(tlsConn, headerBuf)
+	if err != nil {
+		tlsConn.SetReadDeadline(time.Time{})
+		s.fallback(tlsConn, nil)
 		return
 	}
+	tlsConn.SetReadDeadline(time.Time{})
 
 	version := headerBuf[0]
 	msgType := headerBuf[1]
 	clientToken := headerBuf[2:18]
 	targetLen := binary.BigEndian.Uint16(headerBuf[18:20])
 
-	if version != ProtocolVersion {
-		return
-	}
-
-	if subtle.ConstantTimeCompare(clientToken, s.cfg.SecretToken) != 1 {
-		log.Printf("⚠️ 身份验证失败")
+	if version != ProtocolVersion || !checkToken(s.cfg.SecretSeed, clientToken) {
+		buf := make([]byte, 0, HeaderLength)
+		buf = append(buf, headerBuf...)
+		s.fallback(tlsConn, buf)
 		return
 	}
 
 	switch msgType {
 	case CmdPing:
-		if _, err := conn.Write([]byte{ProtocolVersion, CmdPong}); err != nil {
-			log.Printf("⚠️ Pong 写入失败: %v", err)
-		}
+		tlsConn.Write([]byte{ProtocolVersion, CmdPong})
 		return
 
 	case CmdConnect:
@@ -100,17 +137,45 @@ func (s *Server) handleConn(conn net.Conn) {
 			return
 		}
 		addrBuf := make([]byte, targetLen)
-		if _, err := io.ReadFull(conn, addrBuf); err != nil {
+		if _, err := io.ReadFull(tlsConn, addrBuf); err != nil {
 			return
 		}
-		targetAddr := string(addrBuf)
-
-		_ = conn.SetReadDeadline(time.Time{})
-		s.establishTunnel(conn, targetAddr)
+		s.establishTunnel(tlsConn, string(addrBuf))
 
 	default:
 		return
 	}
+}
+
+func (s *Server) fallback(tlsConn net.Conn, prefix []byte) {
+	addr := s.cfg.FallbackAddr
+	if addr == "" {
+		msg := "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+		tlsConn.Write([]byte(msg))
+		return
+	}
+
+	fbConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return
+	}
+	defer fbConn.Close()
+
+	if len(prefix) > 0 {
+		fbConn.Write(prefix)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(fbConn, tlsConn)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(tlsConn, fbConn)
+	}()
+	wg.Wait()
 }
 
 func (s *Server) establishTunnel(conn net.Conn, targetAddr string) {
@@ -124,7 +189,6 @@ func (s *Server) establishTunnel(conn net.Conn, targetAddr string) {
 		log.Printf("❌ 域名解析失败: %s, err: %v", targetAddr, err)
 		return
 	}
-
 	log.Printf("🔍 解析 %s -> %v", host, ips)
 
 	for _, ip := range ips {
@@ -150,31 +214,104 @@ func (s *Server) establishTunnel(conn net.Conn, targetAddr string) {
 
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(targetConn, conn)
-		log.Printf("📤 隧道关闭(客户端→目标), 字节: %d, err: %v", n, err)
-		if tc, ok := targetConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
+		relayWithPadding(conn, targetConn)
 	}()
 
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(conn, targetConn)
-		log.Printf("📥 隧道关闭(目标→客户端), 字节: %d, err: %v", n, err)
+		relayWithPadding(targetConn, conn)
 	}()
 
 	wg.Wait()
 	log.Printf("🔌 隧道已关闭: %s", targetAddr)
 }
 
+func relayWithPadding(dst io.Writer, src io.Reader) {
+	buf := make([]byte, 16384)
+	for {
+		n, err := src.Read(buf)
+		if err != nil {
+			return
+		}
+		if err := writePaddedFrame(dst, buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+func writePaddedFrame(w io.Writer, data []byte) error {
+	dLen := len(data)
+	pLen := 0
+	if MaxPadding > 0 {
+		var b [1]byte
+		rand.Read(b[:])
+		pLen = int(b[0]) % (MaxPadding + 1)
+	}
+	fLen := dLen + pLen
+
+	header := []byte{
+		byte(fLen >> 8), byte(fLen),
+		byte(dLen >> 8), byte(dLen),
+	}
+
+	frame := make([]byte, FrameHeaderSize+fLen)
+	copy(frame[:FrameHeaderSize], header)
+	copy(frame[FrameHeaderSize:], data)
+	if pLen > 0 {
+		rand.Read(frame[FrameHeaderSize+dLen:])
+	}
+
+	_, err := w.Write(frame)
+	return err
+}
+
+func readPaddedFrame(r io.Reader) ([]byte, error) {
+	hdr := make([]byte, FrameHeaderSize)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return nil, err
+	}
+	fLen := int(hdr[0])<<8 | int(hdr[1])
+	dLen := int(hdr[2])<<8 | int(hdr[3])
+	if fLen < dLen || dLen == 0 {
+		return nil, errors.New("invalid frame")
+	}
+
+	frame := make([]byte, fLen)
+	if _, err := io.ReadFull(r, frame); err != nil {
+		return nil, err
+	}
+	return frame[:dLen], nil
+}
+
+type paddedConn struct {
+	net.Conn
+}
+
+func (c *paddedConn) Read(b []byte) (int, error) {
+	data, err := readPaddedFrame(c.Conn)
+	if err != nil {
+		return 0, err
+	}
+	return copy(b, data), nil
+}
+
+func (c *paddedConn) Write(b []byte) (int, error) {
+	err := writePaddedFrame(c.Conn, b)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
 func (s *Server) generateTLSConfig() *tls.Config {
 	certFile := "server.crt"
 	keyFile := "server.key"
 
-	if cert, err := loadCertFromDisk(certFile, keyFile); err == nil {
+	if cert, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
 		log.Println("✅ 已加载 TLS 证书")
 		return &tls.Config{
 			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h2", "http/1.1"},
 		}
 	}
 
@@ -203,8 +340,8 @@ func (s *Server) generateTLSConfig() *tls.Config {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
-	_ = os.WriteFile(certFile, certPEM, 0644)
-	_ = os.WriteFile(keyFile, keyPEM, 0600)
+	os.WriteFile(certFile, certPEM, 0644)
+	os.WriteFile(keyFile, keyPEM, 0600)
 
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
@@ -213,32 +350,35 @@ func (s *Server) generateTLSConfig() *tls.Config {
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2", "http/1.1"},
 	}
 }
 
-func loadCertFromDisk(certFile, keyFile string) (tls.Certificate, error) {
-	if _, err := os.Stat(certFile); os.IsNotExist(err) {
-		return tls.Certificate{}, err
+func getSecretSeed() []byte {
+	if s := os.Getenv("PROXY_TOKEN"); len(s) == 16 {
+		return []byte(s)
 	}
-	if _, err := os.Stat(keyFile); os.IsNotExist(err) {
-		return tls.Certificate{}, err
-	}
-	return tls.LoadX509KeyPair(certFile, keyFile)
-}
-
-func getSecretToken() []byte {
-	if token := os.Getenv("PROXY_TOKEN"); len(token) == 16 {
-		return []byte(token)
-	}
-	log.Println("⚠️ 环境变量 PROXY_TOKEN 未设置或长度不是 16，使用默认硬编码 Token（仅供测试）")
+	log.Println("⚠️ 环境变量 PROXY_TOKEN 未设置或长度不是 16，使用默认硬编码 Seed（仅供测试）")
 	return []byte("my_secure_token!")
 }
 
 func main() {
+	seed := getSecretSeed()
+	fallback := os.Getenv("FALLBACK")
+
+	if fallback == "" {
+		log.Println("ℹ️ FALLBACK 未设置，非法连接将返回 HTTP 404")
+	} else {
+		log.Printf("ℹ️ FALLBACK = %s，非法连接将转发至此地址", fallback)
+	}
+
 	server := NewServer(Config{
-		ListenAddr:  "0.0.0.0:443",
-		SecretToken: getSecretToken(),
+		ListenAddr:   os.Getenv("PROXY_PORT"),
+		SecretSeed:   seed,
+		FallbackAddr: fallback,
 	})
+
+	fmt.Printf("PROXY_TOKEN=%x, current token=%x\n", seed, deriveToken(seed, time.Now().Unix()/TimeSlotSeconds))
 
 	server.Start()
 }
