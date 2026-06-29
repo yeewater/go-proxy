@@ -177,42 +177,44 @@ func (s *Server) handleStream(stream quic.Stream) {
 }
 
 func (s *Server) establishTunnel(stream quic.Stream, targetAddr string) {
-	// 修复：引入安全边界审计，严禁利用代理向 VPS 本地网卡或内网发起穿透嗅探
 	host, port, err := net.SplitHostPort(targetAddr)
 	if err != nil {
 		return
 	}
 
-	// 执行 DNS 预解析拦截
 	ips, err := net.LookupIP(host)
 	if err != nil || len(ips) == 0 {
-		log.Printf("🛑 域名解析失败，拒绝代理请求: %s", targetAddr)
+		log.Printf("❌ 域名解析失败: %s, err: %v", targetAddr, err)
 		return
 	}
+
+	log.Printf("🔍 解析 %s -> %v", host, ips)
+
 	for _, ip := range ips {
 		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
-			log.Printf("🛑 检测到内网地址，拒绝代理请求: %s -> %s", targetAddr, ip)
+			log.Printf("🛑 检测到内网地址: %s -> %s", targetAddr, ip)
 			return
 		}
 	}
 
-	log.Printf("🔗 验证通过，正在建立隧道 -> %s", targetAddr)
-
-	// 用解析后的真实 IP 直连，防止 DNS rebinding 和二次解析
-	var targetConn net.Conn
-	targetConn, err = net.DialTimeout("tcp", net.JoinHostPort(ips[0].String(), port), 5*time.Second)
-
+	dialAddr := net.JoinHostPort(ips[0].String(), port)
+	log.Printf("🔗 正在 TCP 连接: %s", dialAddr)
+	targetConn, err := net.DialTimeout("tcp", dialAddr, 5*time.Second)
 	if err != nil {
+		log.Printf("❌ TCP 连接失败: %s, err: %v", dialAddr, err)
 		return
 	}
 	defer targetConn.Close()
+	log.Printf("✅ TCP 连接成功: %s", dialAddr)
 
+	log.Printf("🔌 隧道已建立: %s", targetAddr)
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(targetConn, stream)
+		n, err := io.Copy(targetConn, stream)
+		log.Printf("📤 隧道关闭(客户端→目标), 字节: %d, err: %v", n, err)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -220,10 +222,12 @@ func (s *Server) establishTunnel(stream quic.Stream, targetAddr string) {
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(stream, targetConn)
+		n, err := io.Copy(stream, targetConn)
+		log.Printf("📥 隧道关闭(目标→客户端), 字节: %d, err: %v", n, err)
 	}()
 
 	wg.Wait()
+	log.Printf("🔌 隧道已关闭: %s", targetAddr)
 }
 
 func (s *Server) generateTLSConfig() *tls.Config {

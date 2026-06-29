@@ -42,11 +42,4 @@ go build -o client client.go
 |---|---|---|
 | `PROXY_TOKEN` | 是 | 16 字节认证 Token（两端必须一致） |
 
-## 调试
 
-Debug 版输出 DNS 解析、TCP 连接、传输字节数等详细日志：
-
-```bash
-go build -o server-debug debug/server-debug.go
-PROXY_TOKEN="你的16字节密钥" ./server-debug
-```
