@@ -219,7 +219,15 @@ func (s *Server) establishTunnel(tlsConn net.Conn, targetAddr string) {
 
 	go func() {
 		defer wg.Done()
-		relayWithPadding(targetConn, tlsConn)
+		for {
+			data, err := readPaddedFrame(tlsConn)
+			if err != nil {
+				return
+			}
+			if _, err := targetConn.Write(data); err != nil {
+				return
+			}
+		}
 	}()
 
 	wg.Wait()

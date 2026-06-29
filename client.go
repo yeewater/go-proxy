@@ -148,18 +148,25 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 
 	_, _ = localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	pc := &paddedConn{Conn: serverConn}
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		relayWithPadding(pc, localConn)
+		relayWithPadding(serverConn, localConn)
 	}()
 
 	go func() {
 		defer wg.Done()
-		relayWithPadding(localConn, pc)
+		for {
+			data, err := readPaddedFrame(serverConn)
+			if err != nil {
+				return
+			}
+			if _, err := localConn.Write(data); err != nil {
+				return
+			}
+		}
 	}()
 
 	wg.Wait()
@@ -221,26 +228,6 @@ func readPaddedFrame(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return frame[:dLen], nil
-}
-
-type paddedConn struct {
-	net.Conn
-}
-
-func (c *paddedConn) Read(b []byte) (int, error) {
-	data, err := readPaddedFrame(c.Conn)
-	if err != nil {
-		return 0, err
-	}
-	return copy(b, data), nil
-}
-
-func (c *paddedConn) Write(b []byte) (int, error) {
-	err := writePaddedFrame(c.Conn, b)
-	if err != nil {
-		return 0, err
-	}
-	return len(b), nil
 }
 
 func getSecretSeed() []byte {
