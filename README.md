@@ -32,8 +32,8 @@ PROXY_TOKEN="你的16字节密钥" ./client 服务器地址:8443
 ## 编译
 
 ```bash
-CGO_ENABLED=0 go build -o server server.go
-CGO_ENABLED=0 go build -o client client.go
+go build -o server server.go
+go build -o client client.go
 ```
 
 ## 环境变量
@@ -47,6 +47,6 @@ CGO_ENABLED=0 go build -o client client.go
 Debug 版输出 DNS 解析、TCP 连接、传输字节数等详细日志：
 
 ```bash
-CGO_ENABLED=0 go build -o server-debug debug/server-debug.go
+go build -o server-debug debug/server-debug.go
 PROXY_TOKEN="你的16字节密钥" ./server-debug
 ```
