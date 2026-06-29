@@ -29,9 +29,8 @@ const (
 	HeaderLength    int   = 20
 
 	TimeSlotSeconds int64 = 300
-
-	FrameHeaderSize = 4
-	MaxPadding      = 512
+	FrameHeaderSize       = 4
+	MaxPadding            = 512
 )
 
 type Config struct {
@@ -81,11 +80,14 @@ func checkToken(seed []byte, received []byte) bool {
 func (s *Server) Start() {
 	tcpListener, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
-		log.Fatalf("Failed to bind TCP port: %v", err)
+		log.Fatalf("Failed to bind port: %v", err)
 	}
 	defer tcpListener.Close()
 
-	tlsConfig := s.generateTLSConfig()
+	tlsConfig := &tls.Config{
+		Certificates: s.loadCertificates(),
+		NextProtos:   []string{"http/1.1"},
+	}
 	listener := tls.NewListener(tcpListener, tlsConfig)
 	defer listener.Close()
 
@@ -150,8 +152,6 @@ func (s *Server) handleConn(tlsConn net.Conn) {
 func (s *Server) fallback(tlsConn net.Conn, prefix []byte) {
 	addr := s.cfg.FallbackAddr
 	if addr == "" {
-		msg := "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
-		tlsConn.Write([]byte(msg))
 		return
 	}
 
@@ -178,7 +178,7 @@ func (s *Server) fallback(tlsConn net.Conn, prefix []byte) {
 	wg.Wait()
 }
 
-func (s *Server) establishTunnel(conn net.Conn, targetAddr string) {
+func (s *Server) establishTunnel(tlsConn net.Conn, targetAddr string) {
 	host, port, err := net.SplitHostPort(targetAddr)
 	if err != nil {
 		return
@@ -214,12 +214,12 @@ func (s *Server) establishTunnel(conn net.Conn, targetAddr string) {
 
 	go func() {
 		defer wg.Done()
-		relayWithPadding(conn, targetConn)
+		relayWithPadding(tlsConn, targetConn)
 	}()
 
 	go func() {
 		defer wg.Done()
-		relayWithPadding(targetConn, conn)
+		relayWithPadding(targetConn, tlsConn)
 	}()
 
 	wg.Wait()
@@ -303,55 +303,32 @@ func (c *paddedConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (s *Server) generateTLSConfig() *tls.Config {
+func (s *Server) loadCertificates() []tls.Certificate {
 	certFile := "server.crt"
 	keyFile := "server.key"
-
-	if cert, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err == nil {
 		log.Println("✅ 已加载 TLS 证书")
-		return &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"h2", "http/1.1"},
-		}
+		return []tls.Certificate{cert}
 	}
 
 	log.Println("🔑 未找到 TLS 证书，正在生成自签名证书...")
-
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		panic(err)
-	}
-
-	now := time.Now()
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	template := x509.Certificate{
 		SerialNumber:          big.NewInt(1),
-		NotBefore:             now.Add(-24 * time.Hour),
-		NotAfter:              now.Add(365 * 24 * time.Hour),
+		NotBefore:             time.Now().Add(-24 * time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-
+	certDER, _ := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-
 	os.WriteFile(certFile, certPEM, 0644)
 	os.WriteFile(keyFile, keyPEM, 0600)
-
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic(err)
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h2", "http/1.1"},
-	}
+	cert, _ = tls.X509KeyPair(certPEM, keyPEM)
+	return []tls.Certificate{cert}
 }
 
 func getSecretSeed() []byte {
@@ -367,18 +344,25 @@ func main() {
 	fallback := os.Getenv("FALLBACK")
 
 	if fallback == "" {
-		log.Println("ℹ️ FALLBACK 未设置，非法连接将返回 HTTP 404")
+		log.Println("ℹ️ FALLBACK 未设置，非法连接直接断开")
 	} else {
 		log.Printf("ℹ️ FALLBACK = %s，非法连接将转发至此地址", fallback)
 	}
 
+	port := os.Getenv("PROXY_PORT")
+	if port == "" {
+		port = ":443"
+	} else if port[0] != ':' {
+		port = ":" + port
+	}
+
 	server := NewServer(Config{
-		ListenAddr:   os.Getenv("PROXY_PORT"),
+		ListenAddr:   port,
 		SecretSeed:   seed,
 		FallbackAddr: fallback,
 	})
 
-	fmt.Printf("PROXY_TOKEN=%x, current token=%x\n", seed, deriveToken(seed, time.Now().Unix()/TimeSlotSeconds))
+	fmt.Printf("seed=%x, current token=%x\n", seed, deriveToken(seed, time.Now().Unix()/TimeSlotSeconds))
 
 	server.Start()
 }
