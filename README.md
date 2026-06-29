@@ -1,10 +1,10 @@
 # go-proxy
 
-基于 HTTP/2 (TLS) 的代理服务。
+基于 TCP+TLS 的代理服务。
 
 ## 功能
 
-- HTTP/2 传输（标准 HTTPS，难以与正常流量区分）
+- TLS 传输（标准 HTTPS 端口 443，难以与正常流量区分）
 - SOCKS5 客户端
 - Token 认证
 - SSRF 保护
@@ -17,7 +17,7 @@
 PROXY_TOKEN="你的16字节密钥" ./server
 ```
 
-默认监听 `:443`，可通过 `PROXY_PORT` 环境变量指定端口。
+默认监听 `:443`。
 
 ### 客户端
 
@@ -40,4 +40,9 @@ go build -o client client.go
 |---|---|---|
 | `PROXY_TOKEN` | 是 | 16 字节认证 Token（两端必须一致） |
 | `PROXY_SERVER` | 客户端 | 服务端地址（默认 `server_ip:443`） |
-| `PROXY_PORT` | 服务端 | 监听端口（默认 `443`） |
+
+## 证书
+
+服务端优先加载当前目录的 `server.crt` / `server.key`，不存在则自动生成自签名证书。
+
+建议用 Let's Encrypt 的真实域名证书替换，流量看起就是普通 HTTPS。

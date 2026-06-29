@@ -6,10 +6,15 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strconv"
 	"sync"
+)
+
+const (
+	ProtocolVersion uint8 = 0x01
+	CmdConnect      uint8 = 0x01
+	HeaderLength    int   = 20
 )
 
 type ClientConfig struct {
@@ -20,21 +25,16 @@ type ClientConfig struct {
 }
 
 type ProxyClient struct {
-	cfg    ClientConfig
-	client *http.Client
+	cfg      ClientConfig
+	tlsCfg   *tls.Config
 }
 
 func NewProxyClient(cfg ClientConfig) *ProxyClient {
 	return &ProxyClient{
 		cfg: cfg,
-		client: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-					ServerName:         cfg.ServerName,
-				},
-			},
-			Timeout: 0,
+		tlsCfg: &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         cfg.ServerName,
 		},
 	}
 }
@@ -112,25 +112,21 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 	targetPort := binary.BigEndian.Uint16(portBuf)
 	targetAddr := net.JoinHostPort(targetHost, strconv.FormatUint(uint64(targetPort), 10))
 
-	pr, pw := io.Pipe()
-	req, err := http.NewRequest(http.MethodPost, "https://"+c.cfg.RemoteAddr+"/tunnel", pr)
-	if err != nil {
-		log.Printf("⚠️ 创建请求失败: %v", err)
-		return
-	}
-	req.Header.Set("X-Token", string(c.cfg.SecretToken))
-	req.Header.Set("X-Target", targetAddr)
-	req.Close = false
-
-	resp, err := c.client.Do(req)
+	serverConn, err := tls.Dial("tcp", c.cfg.RemoteAddr, c.tlsCfg)
 	if err != nil {
 		log.Printf("⚠️ 连接服务端失败: %v", err)
 		return
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("⚠️ 服务端拒绝: %d", resp.StatusCode)
+	header := make([]byte, HeaderLength)
+	header[0] = ProtocolVersion
+	header[1] = CmdConnect
+	copy(header[2:18], c.cfg.SecretToken)
+	binary.BigEndian.PutUint16(header[18:20], uint16(len(targetAddr)))
+
+	packet := append(header, []byte(targetAddr)...)
+	if _, err := serverConn.Write(packet); err != nil {
+		serverConn.Close()
 		return
 	}
 
@@ -141,19 +137,19 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(pw, localConn)
-		pw.Close()
+		_, _ = io.Copy(serverConn, localConn)
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(localConn, resp.Body)
+		_, _ = io.Copy(localConn, serverConn)
 		if tc, ok := localConn.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
 	}()
 
 	wg.Wait()
+	serverConn.Close()
 }
 
 func getSecretToken() []byte {
