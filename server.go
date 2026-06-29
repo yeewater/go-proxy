@@ -86,9 +86,10 @@ func (s *Server) Start() {
 	tlsConfig := s.generateTLSConfig()
 
 	quicConfig := &quic.Config{
-		Allow0RTT:       true,
-		KeepAlivePeriod: 15 * time.Second,
-		MaxIdleTimeout:  s.cfg.MaxIdleTime,
+		Allow0RTT:          true,
+		KeepAlivePeriod:    15 * time.Second,
+		MaxIdleTimeout:     s.cfg.MaxIdleTime,
+		MaxIncomingStreams: 1024,
 	}
 
 	listener, err := quic.Listen(secureConn, tlsConfig, quicConfig)
