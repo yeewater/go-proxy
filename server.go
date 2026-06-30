@@ -26,8 +26,6 @@ const (
 	CmdConnect      uint8 = 0x01
 	CmdPing         uint8 = 0x02
 	CmdPong         uint8 = 0x03
-	HeaderLength    int   = 20
-
 	TimeSlotSeconds int64 = 300
 	FrameHeaderSize       = 4
 	MaxPadding            = 512
@@ -107,25 +105,20 @@ func (s *Server) handleConn(tlsConn net.Conn) {
 	defer tlsConn.Close()
 
 	tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-	headerBuf := make([]byte, HeaderLength)
-	_, err := io.ReadFull(tlsConn, headerBuf)
+	frame, err := readPaddedFrame(tlsConn)
+	tlsConn.SetReadDeadline(time.Time{})
 	if err != nil {
-		tlsConn.SetReadDeadline(time.Time{})
-		s.fallback(tlsConn, nil)
+		s.fallback(tlsConn, frame)
 		return
 	}
-	tlsConn.SetReadDeadline(time.Time{})
 
-	version := headerBuf[0]
-	msgType := headerBuf[1]
-	clientToken := headerBuf[2:18]
-	targetLen := binary.BigEndian.Uint16(headerBuf[18:20])
+	version := frame[0]
+	msgType := frame[1]
+	clientToken := frame[2:18]
+	targetLen := binary.BigEndian.Uint16(frame[18:20])
 
 	if version != ProtocolVersion || !checkToken(s.cfg.SecretSeed, clientToken) {
-		buf := make([]byte, 0, HeaderLength)
-		buf = append(buf, headerBuf...)
-		s.fallback(tlsConn, buf)
+		s.fallback(tlsConn, frame)
 		return
 	}
 
@@ -135,14 +128,13 @@ func (s *Server) handleConn(tlsConn net.Conn) {
 		return
 
 	case CmdConnect:
-		if targetLen == 0 || targetLen > 512 {
+		if targetLen < 3 || targetLen > 512 {
 			return
 		}
-		addrBuf := make([]byte, targetLen)
-		if _, err := io.ReadFull(tlsConn, addrBuf); err != nil {
+		if len(frame) < 20+int(targetLen) {
 			return
 		}
-		s.establishTunnel(tlsConn, string(addrBuf))
+		s.establishTunnel(tlsConn, string(frame[20:20+targetLen]))
 
 	default:
 		return
@@ -208,27 +200,37 @@ func (s *Server) establishTunnel(tlsConn net.Conn, targetAddr string) {
 	defer targetConn.Close()
 	log.Printf("✅ TCP 连接成功: %s", dialAddr)
 
-	log.Printf("🔌 隧道已建立: %s", targetAddr)
+	log.Printf("🔌 隧道已建立: %s (raw=%v)", targetAddr, port == "443")
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	go func() {
-		defer wg.Done()
-		relayWithPadding(tlsConn, targetConn)
-	}()
-
-	go func() {
-		defer wg.Done()
-		for {
-			data, err := readPaddedFrame(tlsConn)
-			if err != nil {
-				return
+	if port == "443" {
+		go func() {
+			defer wg.Done()
+			io.Copy(tlsConn, targetConn)
+		}()
+		go func() {
+			defer wg.Done()
+			io.Copy(targetConn, tlsConn)
+		}()
+	} else {
+		go func() {
+			defer wg.Done()
+			relayWithPadding(tlsConn, targetConn)
+		}()
+		go func() {
+			defer wg.Done()
+			for {
+				data, err := readPaddedFrame(tlsConn)
+				if err != nil {
+					return
+				}
+				if _, err := targetConn.Write(data); err != nil {
+					return
+				}
 			}
-			if _, err := targetConn.Write(data); err != nil {
-				return
-			}
-		}
-	}()
+		}()
+	}
 
 	wg.Wait()
 	log.Printf("🔌 隧道已关闭: %s", targetAddr)

@@ -4,7 +4,6 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -14,13 +13,14 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 const (
 	ProtocolVersion uint8  = 0x01
 	CmdConnect      uint8  = 0x01
-	HeaderLength    int    = 20
-	TimeSlotSeconds int64  = 300
+	TimeSlotSeconds int64 = 300
 	FrameHeaderSize       = 4
 	MaxPadding            = 512
 )
@@ -33,18 +33,11 @@ type ClientConfig struct {
 }
 
 type ProxyClient struct {
-	cfg    ClientConfig
-	tlsCfg *tls.Config
+	cfg ClientConfig
 }
 
 func NewProxyClient(cfg ClientConfig) *ProxyClient {
-	return &ProxyClient{
-		cfg: cfg,
-		tlsCfg: &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         cfg.ServerName,
-		},
-	}
+	return &ProxyClient{cfg: cfg}
 }
 
 func deriveToken(seed []byte, slot int64) []byte {
@@ -126,22 +119,30 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 	targetPort := binary.BigEndian.Uint16(portBuf)
 	targetAddr := net.JoinHostPort(targetHost, strconv.FormatUint(uint64(targetPort), 10))
 
-	serverConn, err := tls.Dial("tcp", c.cfg.RemoteAddr, c.tlsCfg)
+	tcpConn, err := net.DialTimeout("tcp", c.cfg.RemoteAddr, 5*time.Second)
 	if err != nil {
 		log.Printf("⚠️ 连接服务端失败: %v", err)
+		return
+	}
+	serverConn := utls.UClient(tcpConn, &utls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         c.cfg.ServerName,
+	}, utls.HelloChrome_Auto)
+	if err := serverConn.Handshake(); err != nil {
+		tcpConn.Close()
+		log.Printf("⚠️ TLS 握手失败: %v", err)
 		return
 	}
 
 	token := deriveToken(c.cfg.SecretSeed, time.Now().Unix()/TimeSlotSeconds)
 
-	header := make([]byte, HeaderLength)
-	header[0] = ProtocolVersion
-	header[1] = CmdConnect
-	copy(header[2:18], token)
-	binary.BigEndian.PutUint16(header[18:20], uint16(len(targetAddr)))
+	handshake := make([]byte, 0, 2+16+2+len(targetAddr))
+	handshake = append(handshake, ProtocolVersion, CmdConnect)
+	handshake = append(handshake, token...)
+	handshake = append(handshake, byte(len(targetAddr)>>8), byte(len(targetAddr)))
+	handshake = append(handshake, []byte(targetAddr)...)
 
-	packet := append(header, []byte(targetAddr)...)
-	if _, err := serverConn.Write(packet); err != nil {
+	if err := writePaddedFrame(serverConn, handshake); err != nil {
 		serverConn.Close()
 		return
 	}
@@ -151,23 +152,33 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	go func() {
-		defer wg.Done()
-		relayWithPadding(serverConn, localConn)
-	}()
-
-	go func() {
-		defer wg.Done()
-		for {
-			data, err := readPaddedFrame(serverConn)
-			if err != nil {
-				return
+	if targetPort == 443 {
+		go func() {
+			defer wg.Done()
+			io.Copy(serverConn, localConn)
+		}()
+		go func() {
+			defer wg.Done()
+			io.Copy(localConn, serverConn)
+		}()
+	} else {
+		go func() {
+			defer wg.Done()
+			relayWithPadding(serverConn, localConn)
+		}()
+		go func() {
+			defer wg.Done()
+			for {
+				data, err := readPaddedFrame(serverConn)
+				if err != nil {
+					return
+				}
+				if _, err := localConn.Write(data); err != nil {
+					return
+				}
 			}
-			if _, err := localConn.Write(data); err != nil {
-				return
-			}
-		}
-	}()
+		}()
+	}
 
 	wg.Wait()
 	serverConn.Close()
@@ -244,11 +255,16 @@ func main() {
 		addr = "server_ip:443"
 	}
 
+	sni := os.Getenv("PROXY_SNI")
+	if sni == "" {
+		sni = "www.cisco.com"
+	}
+
 	client := NewProxyClient(ClientConfig{
 		LocalSocksAddr: "127.0.0.1:1080",
 		RemoteAddr:     addr,
 		SecretSeed:     getSecretSeed(),
-		ServerName:     "www.cisco.com",
+		ServerName:     sni,
 	})
 
 	log.Printf("当前 Token: %x", deriveToken(getSecretSeed(), time.Now().Unix()/TimeSlotSeconds))
