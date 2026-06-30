@@ -95,9 +95,12 @@ func (s *Server) Start() {
 
 	tlsConfig := &tls.Config{
 		Certificates: s.loadCertificates(),
-		// 与客户端 uTLS HelloChrome_Auto 默认 ALPN 列表对齐 (h2, http/1.1)，
-		// 避免协商结果和客户端预期不一致导致连接退化。
-		NextProtos: []string{"h2", "http/1.1"},
+		// 只声明 http/1.1，刻意不支持 h2。
+		// 原因：ALPN 协商出 h2 后，浏览器/curl 会用 HTTP/2 二进制帧发请求，
+		// 这会被我们自己的 readPaddedFrame 误判成合法私有协议帧（巧合解析"成功"但内容是垃圾），
+		// 同时 fallback 转发给 Caddy 时 Caddy 监听的是明文 h1，无法处理 h2 二进制帧，直接报错。
+		// 服务端只声明 http/1.1，ALPN 协商阶段就不会走到 h2，从根上避免这个问题。
+		NextProtos: []string{"http/1.1"},
 	}
 	listener := tls.NewListener(tcpListener, tlsConfig)
 	defer listener.Close()

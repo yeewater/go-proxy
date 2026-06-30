@@ -130,12 +130,13 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 		return
 	}
 
-	// 显式指定 ALPN，与服务端 NextProtos: []string{"h2", "http/1.1"} 对齐，
-	// 避免协商结果跟服务端预期不一致导致连接退化或被识别为异常握手。
+	// 显式指定 ALPN，与服务端 NextProtos: []string{"http/1.1"} 对齐。
+	// 故意不声明 h2 支持：协商出 h2 会导致后续流量变成 HTTP/2 二进制帧，
+	// 被自定义协议层和 fallback 的 Caddy 都无法正确处理。
 	utlsConfig := &utls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         c.cfg.ServerName,
-		NextProtos:         []string{"h2", "http/1.1"},
+		NextProtos:         []string{"http/1.1"},
 	}
 	serverConn := utls.UClient(tcpConn, utlsConfig, utls.HelloChrome_Auto)
 	if err := serverConn.Handshake(); err != nil {
