@@ -20,9 +20,14 @@ import (
 const (
 	ProtocolVersion uint8  = 0x01
 	CmdConnect      uint8  = 0x01
-	TimeSlotSeconds int64 = 300
-	FrameHeaderSize       = 4
-	MaxPadding            = 512
+	TimeSlotSeconds int64  = 300
+	FrameHeaderSize        = 4
+	MaxPadding             = 512
+
+	// FlagRawMode: 显式声明本次隧道跳过 padding（目标本身已是 TLS 流量，
+	// 双重加密带来的开销收益不大）。两端必须用同一套规则判断，不能各猜各的，
+	// 否则一边加 padding 一边不加会直接导致帧解析错乱。
+	FlagRawMode uint8 = 0x01
 )
 
 type ClientConfig struct {
@@ -124,10 +129,15 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 		log.Printf("⚠️ 连接服务端失败: %v", err)
 		return
 	}
-	serverConn := utls.UClient(tcpConn, &utls.Config{
+
+	// 显式指定 ALPN，与服务端 NextProtos: []string{"h2", "http/1.1"} 对齐，
+	// 避免协商结果跟服务端预期不一致导致连接退化或被识别为异常握手。
+	utlsConfig := &utls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         c.cfg.ServerName,
-	}, utls.HelloChrome_Auto)
+		NextProtos:         []string{"h2", "http/1.1"},
+	}
+	serverConn := utls.UClient(tcpConn, utlsConfig, utls.HelloChrome_Auto)
 	if err := serverConn.Handshake(); err != nil {
 		tcpConn.Close()
 		log.Printf("⚠️ TLS 握手失败: %v", err)
@@ -136,10 +146,18 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 
 	token := deriveToken(c.cfg.SecretSeed, time.Now().Unix()/TimeSlotSeconds)
 
-	handshake := make([]byte, 0, 2+16+2+len(targetAddr))
+	// rawMode 由目标端口显式判断一次，写入协议帧的 flags 字段，
+	// 服务端不再自己猜端口，而是直接读这个字段 —— 两端永远同步。
+	var flags uint8
+	if targetPort == 443 {
+		flags |= FlagRawMode
+	}
+
+	handshake := make([]byte, 0, 2+16+2+1+len(targetAddr))
 	handshake = append(handshake, ProtocolVersion, CmdConnect)
 	handshake = append(handshake, token...)
 	handshake = append(handshake, byte(len(targetAddr)>>8), byte(len(targetAddr)))
+	handshake = append(handshake, flags)
 	handshake = append(handshake, []byte(targetAddr)...)
 
 	if err := writePaddedFrame(serverConn, handshake); err != nil {
@@ -152,7 +170,8 @@ func (c *ProxyClient) handleLocalSocks(localConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	if targetPort == 443 {
+	rawMode := flags&FlagRawMode != 0
+	if rawMode {
 		go func() {
 			defer wg.Done()
 			io.Copy(serverConn, localConn)
@@ -241,11 +260,27 @@ func readPaddedFrame(r io.Reader) ([]byte, error) {
 	return frame[:dLen], nil
 }
 
+// getSecretSeed 优先级: PROXY_TOKEN_FILE > PROXY_TOKEN 环境变量 > 硬编码默认值。
 func getSecretSeed() []byte {
+	if path := os.Getenv("PROXY_TOKEN_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			log.Fatalf("Fatal: 无法读取 PROXY_TOKEN_FILE: %v", err)
+		}
+		s := string(data)
+		// 去除可能的换行符
+		for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
+			s = s[:len(s)-1]
+		}
+		if len(s) != 16 {
+			log.Fatalf("Fatal: PROXY_TOKEN_FILE 内容长度必须是 16 字节，实际为 %d", len(s))
+		}
+		return []byte(s)
+	}
 	if s := os.Getenv("PROXY_TOKEN"); len(s) == 16 {
 		return []byte(s)
 	}
-	log.Println("⚠️ 环境变量 PROXY_TOKEN 未设置或长度不是 16，使用默认硬编码 Seed（仅供测试）")
+	log.Println("⚠️ 未设置 PROXY_TOKEN_FILE / PROXY_TOKEN，使用默认硬编码 Seed（仅供测试，生产环境务必修改）")
 	return []byte("my_secure_token!")
 }
 

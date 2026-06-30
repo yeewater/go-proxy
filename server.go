@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
@@ -17,6 +18,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,12 +31,18 @@ const (
 	TimeSlotSeconds int64 = 300
 	FrameHeaderSize       = 4
 	MaxPadding            = 512
+	MaxFrameSize          = 65535 // 防止恶意 fLen 导致超大内存分配
+
+	// FlagRawMode: 由客户端在握手帧里显式声明本次隧道是否跳过 padding，
+	// 不再用"目标端口是不是 443"去猜测，两端用同一个字段，不会出现误判。
+	FlagRawMode uint8 = 0x01
 )
 
 type Config struct {
 	ListenAddr   string
 	SecretSeed   []byte
 	FallbackAddr string
+	FallbackHost string // fallbackSynthetic 用的 Host 头，应填本机 Caddy 实际配置的域名
 }
 
 type Server struct {
@@ -47,6 +55,9 @@ func NewServer(cfg Config) *Server {
 	}
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = "0.0.0.0:443"
+	}
+	if cfg.FallbackHost == "" {
+		cfg.FallbackHost = "localhost"
 	}
 	return &Server{cfg: cfg}
 }
@@ -84,7 +95,9 @@ func (s *Server) Start() {
 
 	tlsConfig := &tls.Config{
 		Certificates: s.loadCertificates(),
-		NextProtos:   []string{"http/1.1"},
+		// 与客户端 uTLS HelloChrome_Auto 默认 ALPN 列表对齐 (h2, http/1.1)，
+		// 避免协商结果和客户端预期不一致导致连接退化。
+		NextProtos: []string{"h2", "http/1.1"},
 	}
 	listener := tls.NewListener(tcpListener, tlsConfig)
 	defer listener.Close()
@@ -101,14 +114,56 @@ func (s *Server) Start() {
 	}
 }
 
-func (s *Server) handleConn(tlsConn net.Conn) {
-	defer tlsConn.Close()
+// bufConn 包装原始连接，所有读取走 bufio.Reader，
+// 这样 Peek 过的数据不会丢失，fallback 时可以把完整字节流转发出去。
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
 
-	tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	frame, err := readPaddedFrame(tlsConn)
-	tlsConn.SetReadDeadline(time.Time{})
+func newBufConn(c net.Conn) *bufConn {
+	return &bufConn{Conn: c, r: bufio.NewReader(c)}
+}
+
+func (c *bufConn) Read(b []byte) (int, error) {
+	return c.r.Read(b)
+}
+
+func (s *Server) handleConn(rawConn net.Conn) {
+	defer rawConn.Close()
+
+	conn := newBufConn(rawConn)
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	hdr, peekErr := conn.r.Peek(FrameHeaderSize)
+	conn.SetReadDeadline(time.Time{})
+
+	// 任何不能构成合法帧头的情况，统一走 fallback，
+	// 此时缓冲区里的数据完全没有被消费，fallback 转发的是原始完整字节流。
+	if peekErr != nil {
+		s.fallback(conn)
+		return
+	}
+
+	fLen := int(hdr[0])<<8 | int(hdr[1])
+	dLen := int(hdr[2])<<8 | int(hdr[3])
+	if fLen < dLen || dLen == 0 || fLen > MaxFrameSize {
+		s.fallback(conn)
+		return
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	frame, err := readPaddedFrame(conn)
+	conn.SetReadDeadline(time.Time{})
 	if err != nil {
-		s.fallback(tlsConn, frame)
+		// 帧头已经被消费掉一部分，数据不完整，没法干净回落，直接断开。
+		// 正常客户端不会触发这个分支；GFW 探测大概率在上面 peekErr 或长度校验就被拦下。
+		return
+	}
+
+	// 协议帧最短长度: 1(version) + 1(msgType) + 16(token) + 2(targetLen) + 1(flags) = 21
+	if len(frame) < 21 {
+		s.fallbackSynthetic(rawConn)
 		return
 	}
 
@@ -116,32 +171,39 @@ func (s *Server) handleConn(tlsConn net.Conn) {
 	msgType := frame[1]
 	clientToken := frame[2:18]
 	targetLen := binary.BigEndian.Uint16(frame[18:20])
+	flags := frame[20]
 
 	if version != ProtocolVersion || !checkToken(s.cfg.SecretSeed, clientToken) {
-		s.fallback(tlsConn, frame)
+		// token 校验失败时，帧已经被完整读出，没法把"原始字节"丢给 Caddy 了。
+		// 退而求其次：主动发一个干净的 GET 请求给 fallback，至少保证响应正常，
+		// 不会把我们的私有二进制协议内容转发给 Caddy 导致 400。
+		s.fallbackSynthetic(rawConn)
 		return
 	}
 
 	switch msgType {
 	case CmdPing:
-		tlsConn.Write([]byte{ProtocolVersion, CmdPong})
+		conn.Write([]byte{ProtocolVersion, CmdPong})
 		return
 
 	case CmdConnect:
 		if targetLen < 3 || targetLen > 512 {
 			return
 		}
-		if len(frame) < 20+int(targetLen) {
+		if len(frame) < 21+int(targetLen) {
 			return
 		}
-		s.establishTunnel(tlsConn, string(frame[20:20+targetLen]))
+		rawMode := flags&FlagRawMode != 0
+		s.establishTunnel(conn, string(frame[21:21+targetLen]), rawMode)
 
 	default:
 		return
 	}
 }
 
-func (s *Server) fallback(tlsConn net.Conn, prefix []byte) {
+// fallback 用于 peek 阶段就判断出不是合法协议帧的连接：
+// 缓冲区数据完全未被消费，可以把原始字节流原样转发给本地 Caddy。
+func (s *Server) fallback(conn *bufConn) {
 	addr := s.cfg.FallbackAddr
 	if addr == "" {
 		return
@@ -153,24 +215,41 @@ func (s *Server) fallback(tlsConn net.Conn, prefix []byte) {
 	}
 	defer fbConn.Close()
 
-	if len(prefix) > 0 {
-		fbConn.Write(prefix)
-	}
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(fbConn, tlsConn)
+		io.Copy(fbConn, conn)
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(tlsConn, fbConn)
+		io.Copy(conn, fbConn)
 	}()
 	wg.Wait()
 }
 
-func (s *Server) establishTunnel(tlsConn net.Conn, targetAddr string) {
+// fallbackSynthetic 用于已经消费了私有协议帧、但 token 校验失败的场景。
+// 此时没法把原始字节转发出去（已经被解析消费），改为主动构造一个干净的 HTTP 请求，
+// 保证 fallback 服务器返回正常响应，而不是因为收到畸形/二进制数据返回 400。
+func (s *Server) fallbackSynthetic(rawConn net.Conn) {
+	addr := s.cfg.FallbackAddr
+	if addr == "" {
+		return
+	}
+
+	fbConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return
+	}
+	defer fbConn.Close()
+
+	fmt.Fprintf(fbConn, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", s.cfg.FallbackHost)
+	io.Copy(rawConn, fbConn)
+}
+
+// establishTunnel 建立到目标地址的隧道。rawMode 由客户端在握手帧里显式声明，
+// 不再用目标端口号推测是否需要 padding —— 两端用同一个 flag 字段，行为永远一致。
+func (s *Server) establishTunnel(tlsConn net.Conn, targetAddr string, rawMode bool) {
 	host, port, err := net.SplitHostPort(targetAddr)
 	if err != nil {
 		return
@@ -200,11 +279,11 @@ func (s *Server) establishTunnel(tlsConn net.Conn, targetAddr string) {
 	defer targetConn.Close()
 	log.Printf("✅ TCP 连接成功: %s", dialAddr)
 
-	log.Printf("🔌 隧道已建立: %s (raw=%v)", targetAddr, port == "443")
+	log.Printf("🔌 隧道已建立: %s (rawMode=%v)", targetAddr, rawMode)
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	if port == "443" {
+	if rawMode {
 		go func() {
 			defer wg.Done()
 			io.Copy(tlsConn, targetConn)
@@ -282,7 +361,7 @@ func readPaddedFrame(r io.Reader) ([]byte, error) {
 	}
 	fLen := int(hdr[0])<<8 | int(hdr[1])
 	dLen := int(hdr[2])<<8 | int(hdr[3])
-	if fLen < dLen || dLen == 0 {
+	if fLen < dLen || dLen == 0 || fLen > MaxFrameSize {
 		return nil, errors.New("invalid frame")
 	}
 
@@ -291,26 +370,6 @@ func readPaddedFrame(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return frame[:dLen], nil
-}
-
-type paddedConn struct {
-	net.Conn
-}
-
-func (c *paddedConn) Read(b []byte) (int, error) {
-	data, err := readPaddedFrame(c.Conn)
-	if err != nil {
-		return 0, err
-	}
-	return copy(b, data), nil
-}
-
-func (c *paddedConn) Write(b []byte) (int, error) {
-	err := writePaddedFrame(c.Conn, b)
-	if err != nil {
-		return 0, err
-	}
-	return len(b), nil
 }
 
 func (s *Server) loadCertificates() []tls.Certificate {
@@ -341,17 +400,32 @@ func (s *Server) loadCertificates() []tls.Certificate {
 	return []tls.Certificate{cert}
 }
 
+// getSecretSeed 优先级: PROXY_TOKEN_FILE > PROXY_TOKEN 环境变量 > 硬编码默认值。
+// 用文件而非环境变量传递密钥，可以避免密钥出现在 `ps aux` / `/proc/<pid>/environ` 等
+// 容易被本机其他进程读到的地方。
 func getSecretSeed() []byte {
+	if path := os.Getenv("PROXY_TOKEN_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			log.Fatalf("Fatal: 无法读取 PROXY_TOKEN_FILE: %v", err)
+		}
+		s := strings.TrimSpace(string(data))
+		if len(s) != 16 {
+			log.Fatalf("Fatal: PROXY_TOKEN_FILE 内容长度必须是 16 字节，实际为 %d", len(s))
+		}
+		return []byte(s)
+	}
 	if s := os.Getenv("PROXY_TOKEN"); len(s) == 16 {
 		return []byte(s)
 	}
-	log.Println("⚠️ 环境变量 PROXY_TOKEN 未设置或长度不是 16，使用默认硬编码 Seed（仅供测试）")
+	log.Println("⚠️ 未设置 PROXY_TOKEN_FILE / PROXY_TOKEN，使用默认硬编码 Seed（仅供测试，生产环境务必修改）")
 	return []byte("my_secure_token!")
 }
 
 func main() {
 	seed := getSecretSeed()
 	fallback := os.Getenv("FALLBACK")
+	fallbackHost := os.Getenv("FALLBACK_HOST")
 
 	if fallback == "" {
 		log.Println("ℹ️ FALLBACK 未设置，非法连接直接断开")
@@ -370,6 +444,7 @@ func main() {
 		ListenAddr:   port,
 		SecretSeed:   seed,
 		FallbackAddr: fallback,
+		FallbackHost: fallbackHost,
 	})
 
 	fmt.Printf("seed=%x, current token=%x\n", seed, deriveToken(seed, time.Now().Unix()/TimeSlotSeconds))
